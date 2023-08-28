@@ -66,7 +66,7 @@ __device__ int getPixelFromPos(double2 pos){
 /*
 Creates a pendulum object from the x and z coordinate of the ball.
 */
-__device__ void createPendulumFrom2DBallPos(pendulum *penPointer, double2 Ball2D, double3 origin, float armLength)
+__device__ pendulum* createPendulumFrom2DBallPos(double2 Ball2D, double3 origin, float armLength)
 {
     // calculate at what height the ball should connect
     Ball2D.x -= origin.x;
@@ -77,11 +77,10 @@ __device__ void createPendulumFrom2DBallPos(pendulum *penPointer, double2 Ball2D
     double BallZ = -sqrt(pow(armLength, 2) - pow(Ball2D.x, 2) - pow(Ball2D.y, 2));
 
     if(isnan(BallZ)){
-        penPointer = NULL;
-        return;
+        return NULL;
     }
 
-
+    pendulum * penPointer = (pendulum *) malloc(sizeof(pendulum));
     penPointer->ballPos = add({Ball2D.x, Ball2D.y, BallZ} , origin);
     penPointer->origin = origin;
     penPointer->armLength = armLength;
@@ -91,6 +90,7 @@ __device__ void createPendulumFrom2DBallPos(pendulum *penPointer, double2 Ball2D
     // Now we need to calculate the angles of our pendulum
 
     calcAngleFromBallPos(penPointer);
+    return penPointer;
 }
 
 
@@ -137,7 +137,7 @@ __device__ void updatePendulum(pendulum* pen, double3 Fexternal)
     calcBallPosFromAngle(pen);
 }
 
-__global__ void pendulumPathKernel(int3 *outputPixels, pendulum *pendulums, double2 start)
+__global__ void pendulumPathKernel(int3 *outputPixels, double2 start)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= TOTAL_PIXELS)
@@ -149,8 +149,7 @@ __global__ void pendulumPathKernel(int3 *outputPixels, pendulum *pendulums, doub
     }
     double2 ballPos = start;
 
-    pendulum * pen = &pendulums[tid];
-    createPendulumFrom2DBallPos(pen, ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
+    pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
 
     if(pen == NULL){
         return;
@@ -198,7 +197,7 @@ __device__ float minMagnetDistance(double3 ballPos, double3 *magnets, int numMag
     return best_dist;
 }
 
-__global__ void magnetKernel(int3 *outputPixels, pendulum *pendulums, double3 *magnets, int numMagnets)
+__global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnets)
 {
     int pixel_i = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -208,8 +207,7 @@ __global__ void magnetKernel(int3 *outputPixels, pendulum *pendulums, double3 *m
     }
     double2 ballPos = getPosFromPixel(pixel_i);
 
-    pendulum * pen = &pendulums[pixel_i];
-    createPendulumFrom2DBallPos(pen, ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
+    pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
     if(pen == NULL){
         outputPixels[pixel_i] = {0,0,0};
         return;
@@ -285,17 +283,15 @@ int main()
 
     int3 *d_result;
     cudaMalloc((void **)&d_result, TOTAL_PIXELS * sizeof(int3));
-    pendulum *d_pendulums;
-    cudaMalloc((void **)&d_pendulums, TOTAL_PIXELS * sizeof(pendulum));
-    if(d_result == NULL || d_pendulums == NULL){
+    if(d_result == NULL){
         printf("NULLLPOINTER1\n");
         exit(1);
     }
     cudaMalloc((void **)&d_magnets, numMagnets * sizeof(double3));
     cudaMemcpy(d_magnets, h_magnets, numMagnets * sizeof(double3), cudaMemcpyHostToDevice);
     printf("calling kernel <<<%d, %d>>>\n", numBlocks, threadsPerBlock);
-    //pendulumPathKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_pendulums, {5, 2});
-    magnetKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_pendulums, d_magnets, numMagnets);
+    //pendulumPathKernel<<<numBlocks, threadsPerBlock>>>(d_result, {5, 2});
+    magnetKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_magnets, numMagnets);
 
     cudaDeviceSynchronize();
 
