@@ -66,7 +66,7 @@ __device__ int getPixelFromPos(double2 pos){
 /*
 Creates a pendulum object from the x and z coordinate of the ball.
 */
-__device__ void createPendulumFrom2DBallPos(pendulum *penPointer, double2 Ball2D, double3 origin, float armLength)
+__device__ pendulum * createPendulumFrom2DBallPos(pendulum * penPointer, double2 Ball2D, double3 origin, float armLength)
 {
     // calculate at what height the ball should connect
     Ball2D.x -= origin.x;
@@ -137,7 +137,7 @@ __device__ void updatePendulum(pendulum* pen, double3 Fexternal)
     calcBallPosFromAngle(pen);
 }
 
-__global__ void pendulumPathKernel(int3 *outputPixels, pendulum *pendulums, double2 start)
+__global__ void pendulumPathKernel(int3 *outputPixels, pendulum * pendulums, double2 start)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= TOTAL_PIXELS)
@@ -151,7 +151,6 @@ __global__ void pendulumPathKernel(int3 *outputPixels, pendulum *pendulums, doub
 
     pendulum * pen = &pendulums[tid];
     createPendulumFrom2DBallPos(pen, ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
-
     if(pen == NULL){
         return;
     }
@@ -198,7 +197,7 @@ __device__ float minMagnetDistance(double3 ballPos, double3 *magnets, int numMag
     return best_dist;
 }
 
-__global__ void magnetKernel(int3 *outputPixels, pendulum *pendulums, double3 *magnets, int numMagnets)
+__global__ void magnetKernel(int3 *outputPixels, pendulum* pendulums, double3 *magnets, int numMagnets)
 {
     int pixel_i = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -218,6 +217,7 @@ __global__ void magnetKernel(int3 *outputPixels, pendulum *pendulums, double3 *m
     if (minMagnetDistance({ballPos.x, ballPos.y, 0}, magnets, numMagnets) < 0.25)
     {
         outputPixels[pixel_i] = {255, 255, 255};
+        // free(pen);
         return;
     }
 
@@ -247,6 +247,7 @@ __global__ void magnetKernel(int3 *outputPixels, pendulum *pendulums, double3 *m
             closest = i + 1;
         }
     }
+    // free(pen);
     int intensity = 255 - ((int)best_dist * 10);
     switch (closest)
     {
@@ -285,17 +286,22 @@ int main()
 
     int3 *d_result;
     cudaMalloc((void **)&d_result, TOTAL_PIXELS * sizeof(int3));
-    pendulum *d_pendulums;
-    cudaMalloc((void **)&d_pendulums, TOTAL_PIXELS * sizeof(pendulum));
-    if(d_result == NULL || d_pendulums == NULL){
+    if(d_result == NULL){
+        printf("NULLLPOINTER1\n");
+        exit(1);
+    }
+
+    pendulum *d_pendulum;
+    cudaMalloc((void **)&d_pendulum, TOTAL_PIXELS * sizeof(pendulum));
+    if(d_pendulum == NULL){
         printf("NULLLPOINTER1\n");
         exit(1);
     }
     cudaMalloc((void **)&d_magnets, numMagnets * sizeof(double3));
     cudaMemcpy(d_magnets, h_magnets, numMagnets * sizeof(double3), cudaMemcpyHostToDevice);
     printf("calling kernel <<<%d, %d>>>\n", numBlocks, threadsPerBlock);
-    //pendulumPathKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_pendulums, {5, 2});
-    magnetKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_pendulums, d_magnets, numMagnets);
+    //pendulumPathKernel<<<numBlocks, threadsPerBlock>>>(d_result, {5, 2});
+    magnetKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_pendulum, d_magnets, numMagnets);
 
     cudaDeviceSynchronize();
 
@@ -308,6 +314,7 @@ int main()
     cudaMemcpy(out, d_result, TOTAL_PIXELS * sizeof(int3), cudaMemcpyDeviceToHost);
     cudaFree(d_result);
     cudaFree(d_magnets);
+    cudaFree(d_pendulum);
 
     // converting our result to the ppm format
     printf("total Pixels: %d, (%dx%d)\n", TOTAL_PIXELS, PIXELS_PER_ROW, PIXELS_PER_ROW);
