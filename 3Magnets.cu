@@ -4,16 +4,21 @@
 #include "vecOpperations.cu"
 #include <cuda_runtime.h>
 
-#define MAX_ITTERATIONS 1000
+#define MAX_ITTERATIONS 1000000
 // N determines the coordinate system. The image will show the coordinates -N to N in both directions
 #define N 10
-#define Dt 0.05
+#define Dt 0.01
 #define FGRAVITY 9.81
 #define FMAGNET 100
+#define MAGNET_ARRANGEMENT_R 3
+#define MAGNET_VISUAL_RADIUS 0.2
 #define PENDULUM_ORIGIN {0,0, 10}
 #define PENDULUM_ARM 10
-#define DAMPING 0.99
-#define PIXELSPERUNIT 50
+#define DAMPING 0.9999
+#define PIXELSPERUNIT 10
+// POS_VICINITY is used to determine when to stop. It determines when the previous position is no longer close enough.
+#define POS_VICINITY 0.000001
+#define UNMOVED_ITTERATION_THRESHOLD 10
 #define PIXELS_PER_ROW (N * 2 * PIXELSPERUNIT)
 #define TOTAL_PIXELS (int)pow(PIXELS_PER_ROW, 2)
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
@@ -81,10 +86,14 @@ __device__ pendulum* createPendulumFrom2DBallPos(double2 Ball2D, double3 origin,
     }
 
     pendulum * penPointer = (pendulum *) malloc(sizeof(pendulum));
+    if(penPointer == NULL){
+        printf("NULL_ptr IN KERNEL\n");
+        return NULL;
+    }
     penPointer->ballPos = add({Ball2D.x, Ball2D.y, BallZ} , origin);
     penPointer->origin = origin;
     penPointer->armLength = armLength;
-    penPointer->phiVelocity = 0.5;
+    penPointer->phiVelocity = 0;
     penPointer->thetaVelocity = 0;
     penPointer->ballMass = 1;
     // Now we need to calculate the angles of our pendulum
@@ -137,36 +146,6 @@ __device__ void updatePendulum(pendulum* pen, double3 Fexternal)
     calcBallPosFromAngle(pen);
 }
 
-__global__ void pendulumPathKernel(int3 *outputPixels, double2 start)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= TOTAL_PIXELS)
-    {
-        return;
-    }else if(tid != 0){
-        outputPixels[tid] = {0,0,0};
-        return;
-    }
-    double2 ballPos = start;
-
-    pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
-
-    if(pen == NULL){
-        return;
-    }
-    int iter = 0;
-    while(iter < MAX_ITTERATIONS){
-        int pixelIndex = getPixelFromPos({pen->ballPos.x, pen->ballPos.y});
-        outputPixels[pixelIndex] = {255,255,255};
-        iter += 1;
-        updatePendulum(pen, {0, 0, -1});
-    }
-
-    free(pen);
-    return;
-}
-
-
 __device__ float pythagoras(double2 pointA, double2 pointB)
 {
     return sqrt(pow(pointA.x - pointB.x, 2) + pow(pointA.y - pointB.y, 2));
@@ -197,25 +176,27 @@ __device__ float minMagnetDistance(double3 ballPos, double3 *magnets, int numMag
     return best_dist;
 }
 
-__global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnets)
+__global__ void pendulumPathKernel(int3 *outputPixels, double2 start, double3 *magnets, int numMagnets)
 {
     int pixel_i = blockIdx.x * blockDim.x + threadIdx.x;
-    
     if (pixel_i >= TOTAL_PIXELS)
     {
         return;
+    }else if(pixel_i != 0){
+        double2 pos = getPosFromPixel(pixel_i);
+        if (minMagnetDistance({pos.x, pos.y, 0}, magnets, numMagnets) < MAGNET_VISUAL_RADIUS)
+        {
+            outputPixels[pixel_i] = {0, 0, 255};
+        }else{
+            outputPixels[pixel_i] = {0,0,0};
+        }
+        return;
     }
-    double2 ballPos = getPosFromPixel(pixel_i);
+    double2 ballPos = start;
 
     pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
     if(pen == NULL){
         outputPixels[pixel_i] = {0,0,0};
-        return;
-    }
-
-    if (minMagnetDistance({ballPos.x, ballPos.y, 0}, magnets, numMagnets) < 0.25)
-    {
-        outputPixels[pixel_i] = {255, 255, 255};
         return;
     }
 
@@ -228,10 +209,75 @@ __global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnet
             double3 force = calcMagnetsForce(pen->ballPos, magnets[i]);
             Fres = add(force, Fres);
         }
+
         updatePendulum(pen, Fres);
+        int index = getPixelFromPos({pen->ballPos.x, pen->ballPos.y});
+        
+        if(index < TOTAL_PIXELS){
+            outputPixels[index] = {255,255,255};
+        }
+        itteration += 1;
+    }
+    int index = getPixelFromPos(start);
+    if(index < TOTAL_PIXELS){
+        outputPixels[index] = {0,255,0};
+    }
+    free(pen);
+}
+
+__global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnets)
+{
+    int pixel_i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pixel_i >= TOTAL_PIXELS)
+    {
+        return;
+    }
+
+    double2 ballPos = getPosFromPixel(pixel_i);
+    pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
+    if(pen == NULL){
+        outputPixels[pixel_i] = {0,0,0};
+        return;
+    }
+
+    if (minMagnetDistance({ballPos.x, ballPos.y, 0}, magnets, numMagnets) < MAGNET_VISUAL_RADIUS)
+    {
+        free(pen);
+        outputPixels[pixel_i] = {255, 255, 255};
+        return;
+    }
+    
+    int itterationsInSamePos = 0;
+    // this prevPosition is only updated if we get outside of it's close facinity.
+    double3 prevPosition = pen->ballPos;
+    int itteration = 0;
+    while (itteration < MAX_ITTERATIONS && itterationsInSamePos < UNMOVED_ITTERATION_THRESHOLD)
+    {
+        double3 Fres = {0, 0, -FGRAVITY * pen->ballMass};
+        for (int i = 0; i < numMagnets; i++)
+        {
+            double3 force = calcMagnetsForce(pen->ballPos, magnets[i]);
+            Fres = add(force, Fres);
+        }
+
+        // if(pixel_i == 451){
+        //     printDouble3(pen->ballPos, "pos");   
+        // }
+        updatePendulum(pen, Fres);
+        itterationsInSamePos += 1;
+        if(distance(prevPosition, pen->ballPos) > POS_VICINITY){
+
+            itterationsInSamePos = 0;
+            prevPosition = pen->ballPos;
+        }
+        
         itteration += 1;
     }
 
+    // if(itterationsInSamePos < UNMOVED_ITTERATION_THRESHOLD){
+    //     printf("NO STOP\n");
+    //     //printf("STOPED\n");
+    // }
 
     int closest = 0;
     float best_dist = 9999999999999;
@@ -245,6 +291,7 @@ __global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnet
             closest = i + 1;
         }
     }
+    free(pen);
     int intensity = 255 - ((int)best_dist * 10);
     switch (closest)
     {
@@ -258,7 +305,7 @@ __global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnet
         outputPixels[pixel_i] = {0, 0, intensity};
         return;
     default:
-        outputPixels[pixel_i] = {0, 0, 0};
+        outputPixels[pixel_i] = {1, 1, 1};
         return;
     }
 }
@@ -266,17 +313,27 @@ __global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnet
 int main()
 {
     int totalThreads = pow(N * 2 * PIXELSPERUNIT, 2);
-    int threadsPerBlock = 1024;
+    int threadsPerBlock = 512;
     int numBlocks = (int)ceil((float)totalThreads / threadsPerBlock);
 
     // Initialize d_magnets on the host
-    int numMagnets = 4;
+    // int numMagnets = 4;
+    // double3 h_magnets[numMagnets] = {
+    //     {5, 5, 0},
+    //     {-5, 5, 0},
+    //     {-5, -5, 0},
+    //     {5, -5, 0},
+    // };
+    int numMagnets = 3;
+    float theta = 0;
     double3 h_magnets[numMagnets] = {
-        {5, 5, 0},
-        {-5, 5, 0},
-        {-5, -5, 0},
-        {5, -5, 0},
+        {MAGNET_ARRANGEMENT_R*cos(theta), MAGNET_ARRANGEMENT_R*sin(theta), 0},
+        {MAGNET_ARRANGEMENT_R*cos(theta + (2*M_PI/3)), MAGNET_ARRANGEMENT_R*sin(theta + (2*M_PI/3)), 0},
+        {MAGNET_ARRANGEMENT_R*cos(theta + (4*M_PI/3)), MAGNET_ARRANGEMENT_R*sin(theta + (4*M_PI/3)), 0},
     };
+    printDouble3Host(h_magnets[0], "M1");
+    printDouble3Host(h_magnets[1], "M2");
+    printDouble3Host(h_magnets[2], "M3");
     double3 *d_magnets;
     // 1gb
     cudaDeviceSetLimit(cudaLimitMallocHeapSize, pow(2, 30));
@@ -284,20 +341,33 @@ int main()
     int3 *d_result;
     cudaMalloc((void **)&d_result, TOTAL_PIXELS * sizeof(int3));
     if(d_result == NULL){
-        printf("NULLLPOINTER1\n");
+        printf("NULLPOINTER1\n");
         exit(1);
     }
     cudaMalloc((void **)&d_magnets, numMagnets * sizeof(double3));
+    if(d_magnets == NULL){
+        cudaFree(d_result);
+        printf("NULLPOINTER2\n");
+        exit(1);
+    }
+
     cudaMemcpy(d_magnets, h_magnets, numMagnets * sizeof(double3), cudaMemcpyHostToDevice);
     printf("calling kernel <<<%d, %d>>>\n", numBlocks, threadsPerBlock);
-    //pendulumPathKernel<<<numBlocks, threadsPerBlock>>>(d_result, {5, 2});
+    //pendulumPathKernel<<<numBlocks, threadsPerBlock>>>(d_result, {5, 5}, d_magnets, numMagnets);
     magnetKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_magnets, numMagnets);
+    cudaError_t cudaError = cudaGetLastError();
+    if (cudaError != cudaSuccess) {
+        printf("CUDA Error: %s\n", cudaGetErrorString(cudaError));
+        exit(1);
+    }
 
     cudaDeviceSynchronize();
 
     int3 *out = (int3 *)malloc(TOTAL_PIXELS * sizeof(int3));
     if(out == NULL){
-        printf("NULLLPOINTER2\n");
+        cudaFree(d_result);
+        cudaFree(d_magnets);
+        printf("NULLLPOINTER3\n");
         exit(1);
     }
 
