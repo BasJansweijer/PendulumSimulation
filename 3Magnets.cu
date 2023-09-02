@@ -3,27 +3,15 @@
 #include <math.h>
 #include "vecOpperations.cu"
 #include <cuda_runtime.h>
+#include "SimulationConfiguration.h"
 
-#define MAX_ITTERATIONS 1000000
-// N determines the coordinate system. The image will show the coordinates -N to N in both directions
-#define N 10
-#define Dt 0.01
-#define FGRAVITY 9.81
-#define FMAGNET 100
-#define MAGNET_ARRANGEMENT_R 3
-#define MAGNET_VISUAL_RADIUS 0.2
-#define PENDULUM_ORIGIN {0,0, 10}
-#define PENDULUM_ARM 10
-#define DAMPING 0.9999
-#define PIXELSPERUNIT 10
-// POS_VICINITY is used to determine when to stop. It determines when the previous position is no longer close enough.
-#define POS_VICINITY 0.000001
-#define UNMOVED_ITTERATION_THRESHOLD 10
 #define PIXELS_PER_ROW (N * 2 * PIXELSPERUNIT)
 #define TOTAL_PIXELS (int)pow(PIXELS_PER_ROW, 2)
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
+#define NO_CPU_MEM_MSG "Not enough RAM!\n Lower the image quality settings to use less memory\n"
+#define NO_GPU_MEM_MSG "Not enough VRAM!\n Increase the setting MAX_VRAM_USAGE (if your gpu has enough VRAM)\n or lower the image quality settings to use less memory.\n"
 
 typedef struct pendulum
 {
@@ -87,7 +75,7 @@ __device__ pendulum* createPendulumFrom2DBallPos(double2 Ball2D, double3 origin,
 
     pendulum * penPointer = (pendulum *) malloc(sizeof(pendulum));
     if(penPointer == NULL){
-        printf("NULL_ptr IN KERNEL\n");
+        printf(NO_GPU_MEM_MSG);
         return NULL;
     }
     penPointer->ballPos = add({Ball2D.x, Ball2D.y, BallZ} , origin);
@@ -194,7 +182,7 @@ __global__ void pendulumPathKernel(int3 *outputPixels, double2 start, double3 *m
     }
     double2 ballPos = start;
 
-    pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
+    pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM_LENGTH);
     if(pen == NULL){
         outputPixels[pixel_i] = {0,0,0};
         return;
@@ -234,7 +222,7 @@ __global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnet
     }
 
     double2 ballPos = getPosFromPixel(pixel_i);
-    pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM);
+    pendulum * pen = createPendulumFrom2DBallPos(ballPos, PENDULUM_ORIGIN, PENDULUM_ARM_LENGTH);
     if(pen == NULL){
         outputPixels[pixel_i] = {0,0,0};
         return;
@@ -274,11 +262,6 @@ __global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnet
         itteration += 1;
     }
 
-    // if(itterationsInSamePos < UNMOVED_ITTERATION_THRESHOLD){
-    //     printf("NO STOP\n");
-    //     //printf("STOPED\n");
-    // }
-
     int closest = 0;
     float best_dist = 9999999999999;
     for (int i = 0; i < numMagnets; i++)
@@ -292,7 +275,8 @@ __global__ void magnetKernel(int3 *outputPixels, double3 *magnets, int numMagnet
         }
     }
     free(pen);
-    int intensity = 255 - ((int)best_dist * 10);
+    //int intensity = 255 * (1 - itteration/MAX_ITTERATIONS);
+    int intensity = 255;
     switch (closest)
     {
     case 1:
@@ -315,46 +299,33 @@ int main()
     int totalThreads = pow(N * 2 * PIXELSPERUNIT, 2);
     int threadsPerBlock = 512;
     int numBlocks = (int)ceil((float)totalThreads / threadsPerBlock);
+     
+    printf("MAGNET POSITIONS:\n");
+    for(int i = 0; i< NUM_MAGNETS; i++){
+        printf("(Magnet %d) x: %.4lf, y: %.4lf, z: %.4lf\n", i+1, magnets[i].x, magnets[i].y, magnets[i].z);
+    }
 
-    // Initialize d_magnets on the host
-    // int numMagnets = 4;
-    // double3 h_magnets[numMagnets] = {
-    //     {5, 5, 0},
-    //     {-5, 5, 0},
-    //     {-5, -5, 0},
-    //     {5, -5, 0},
-    // };
-    int numMagnets = 3;
-    float theta = 0;
-    double3 h_magnets[numMagnets] = {
-        {MAGNET_ARRANGEMENT_R*cos(theta), MAGNET_ARRANGEMENT_R*sin(theta), 0},
-        {MAGNET_ARRANGEMENT_R*cos(theta + (2*M_PI/3)), MAGNET_ARRANGEMENT_R*sin(theta + (2*M_PI/3)), 0},
-        {MAGNET_ARRANGEMENT_R*cos(theta + (4*M_PI/3)), MAGNET_ARRANGEMENT_R*sin(theta + (4*M_PI/3)), 0},
-    };
-    printDouble3Host(h_magnets[0], "M1");
-    printDouble3Host(h_magnets[1], "M2");
-    printDouble3Host(h_magnets[2], "M3");
     double3 *d_magnets;
-    // 1gb
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, pow(2, 30));
+    cudaDeviceSetLimit(cudaLimitMallocHeapSize, MAX_VRAM_USAGE);
 
     int3 *d_result;
     cudaMalloc((void **)&d_result, TOTAL_PIXELS * sizeof(int3));
     if(d_result == NULL){
-        printf("NULLPOINTER1\n");
+        printf(NO_GPU_MEM_MSG);
         exit(1);
     }
-    cudaMalloc((void **)&d_magnets, numMagnets * sizeof(double3));
+    cudaMalloc((void **)&d_magnets, NUM_MAGNETS * sizeof(double3));
     if(d_magnets == NULL){
         cudaFree(d_result);
-        printf("NULLPOINTER2\n");
+        printf(NO_GPU_MEM_MSG);
         exit(1);
     }
 
-    cudaMemcpy(d_magnets, h_magnets, numMagnets * sizeof(double3), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_magnets, magnets, NUM_MAGNETS * sizeof(double3), cudaMemcpyHostToDevice);
     printf("calling kernel <<<%d, %d>>>\n", numBlocks, threadsPerBlock);
-    //pendulumPathKernel<<<numBlocks, threadsPerBlock>>>(d_result, {5, 5}, d_magnets, numMagnets);
-    magnetKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_magnets, numMagnets);
+    printf("total Pixels: %d, (%dx%d)\n", TOTAL_PIXELS, PIXELS_PER_ROW, PIXELS_PER_ROW);
+    //pendulumPathKernel<<<numBlocks, threadsPerBlock>>>(d_result, {5, 5}, d_magnets, NUM_MAGNETS);
+    magnetKernel<<<numBlocks, threadsPerBlock>>>(d_result, d_magnets, NUM_MAGNETS);
     cudaError_t cudaError = cudaGetLastError();
     if (cudaError != cudaSuccess) {
         printf("CUDA Error: %s\n", cudaGetErrorString(cudaError));
@@ -367,7 +338,7 @@ int main()
     if(out == NULL){
         cudaFree(d_result);
         cudaFree(d_magnets);
-        printf("NULLLPOINTER3\n");
+        printf(NO_CPU_MEM_MSG);
         exit(1);
     }
 
@@ -376,7 +347,6 @@ int main()
     cudaFree(d_magnets);
 
     // converting our result to the ppm format
-    printf("total Pixels: %d, (%dx%d)\n", TOTAL_PIXELS, PIXELS_PER_ROW, PIXELS_PER_ROW);
     FILE *fp = fopen("out.ppm", "w");
     fprintf(fp, "P3 %d %d 255", PIXELS_PER_ROW, PIXELS_PER_ROW);
     for (int i = 0; i < TOTAL_PIXELS; i++)
